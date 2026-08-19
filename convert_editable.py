@@ -7,6 +7,7 @@ new presentation, and the new presentation is saved as an Open XML file.
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -71,6 +72,7 @@ def discover_files(
     *,
     recursive: bool = False,
     exclude_dir: str | Path | None = None,
+    exclude_suffix: str | None = DEFAULT_SUFFIX,
 ) -> list[Path]:
     """Expand files and directories into a sorted, de-duplicated file list.
 
@@ -107,6 +109,8 @@ def discover_files(
         for candidate in candidates:
             resolved = candidate.resolve()
             if excluded and _is_relative_to(resolved, excluded):
+                continue
+            if exclude_suffix and candidate.stem.endswith(exclude_suffix):
                 continue
             if is_supported_file(candidate):
                 found[resolved] = resolved
@@ -157,7 +161,12 @@ class PowerPointConverter:
 
         try:
             self._app = win32.DispatchEx("PowerPoint.Application")
-            self._app.Visible = self.visible
+            # PowerPoint starts hidden when launched through COM. Some Office
+            # builds reject an explicit ``Visible = False`` assignment with
+            # "Hiding the application window is not allowed", so only make
+            # the affirmative request here.
+            if self.visible:
+                self._app.Visible = True
             # 0 = ppAlertsNone. We ask the user to opt into overwrite through
             # the CLI, so PowerPoint should not stop on an overwrite prompt.
             self._app.DisplayAlerts = 0
@@ -250,3 +259,235 @@ class PowerPointConverter:
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         self.close()
 
+
+# The script is intentionally self-contained. Copy this file into a folder
+# containing presentations, then run ``python convert_editable.py``.
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def default_scan_dir() -> Path:
+    """Choose the current folder, falling back to the script folder.
+
+    The current folder is useful when the module is installed as a CLI entry
+    point. The fallback keeps the copy-the-script workflow working even when
+    the script is launched from another working directory.
+    """
+
+    current_dir = Path.cwd().resolve()
+    if any(is_supported_file(path) for path in current_dir.iterdir()):
+        return current_dir
+    return SCRIPT_DIR
+
+
+def build_parser() -> argparse.ArgumentParser:
+    formats = ", ".join(sorted(OUTPUT_FORMATS))
+    parser = argparse.ArgumentParser(
+        prog="convert_editable.py",
+        description="选择并转换当前目录中的 PowerPoint 文件。",
+    )
+    parser.add_argument(
+        "inputs",
+        nargs="*",
+        metavar="INPUT",
+        help="可选的文件或文件夹；不填写时扫描本脚本所在目录",
+    )
+    parser.add_argument(
+        "-r",
+        "--recursive",
+        action="store_true",
+        help="递归扫描输入文件夹",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="跳过选择菜单，转换找到的全部文件",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="允许覆盖已有的输出文件",
+    )
+    parser.add_argument(
+        "--visible",
+        action="store_true",
+        help="显示 PowerPoint 窗口",
+    )
+    parser.add_argument(
+        "--suffix",
+        default=DEFAULT_SUFFIX,
+        help=f"输出文件名后缀（默认：{DEFAULT_SUFFIX}）",
+    )
+    parser.add_argument(
+        "--output-format",
+        choices=sorted(OUTPUT_FORMATS),
+        default="pptx",
+        help=f"输出格式（默认：pptx；可选：{formats}）",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只显示选择和输出路径，不启动 PowerPoint",
+    )
+    return parser
+
+
+def _display_name(path: Path, root: Path) -> str:
+    """Use a short relative name when a file is under the scan directory."""
+
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
+
+
+def choose_files(files: Sequence[Path], root: Path) -> list[Path]:
+    """Display an interactive menu and return the user's selection."""
+
+    print("发现以下 PowerPoint 文件：")
+    for index, path in enumerate(files, start=1):
+        print(f"  [{index}] {_display_name(path, root)}")
+    print("  [a] 全部转换")
+    print("  [q] 退出")
+
+    while True:
+        try:
+            answer = input("请输入编号（可用逗号选择多个）：").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return []
+
+        if answer in {"q", "quit", "0"}:
+            return []
+        if answer in {"a", "all"}:
+            return list(files)
+        if not answer:
+            print("请输入文件编号，或输入 a 全部转换、q 退出。")
+            continue
+
+        selected: list[Path] = []
+        invalid = False
+        for token in answer.replace("，", ",").split(","):
+            token = token.strip()
+            try:
+                index = int(token)
+            except ValueError:
+                invalid = True
+                break
+            if not 1 <= index <= len(files):
+                invalid = True
+                break
+            path = files[index - 1]
+            if path not in selected:
+                selected.append(path)
+
+        if invalid or not selected:
+            print("编号无效，请重新输入。")
+            continue
+        return selected
+
+
+def _confirm_overwrite(path: Path) -> bool:
+    try:
+        answer = input(f"输出文件已存在：{path.name}，是否覆盖？[y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer in {"y", "yes", "是"}
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    # With no positional arguments, the copied script operates on its own
+    # directory. This is what makes it portable by simple copy and paste.
+    scan_root = default_scan_dir() if not args.inputs else Path.cwd().resolve()
+    input_paths: Sequence[str | Path] = args.inputs or [scan_root]
+    try:
+        files = discover_files(
+            input_paths,
+            recursive=args.recursive,
+            exclude_suffix=args.suffix,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"输入错误：{exc}")
+        return 2
+
+    if not files:
+        print("没有找到可处理的 PowerPoint 文件。")
+        return 1
+
+    if args.all or args.inputs or args.dry_run:
+        selected = files
+    else:
+        selected = choose_files(files, scan_root)
+        if not selected:
+            print("没有选择文件，程序结束。")
+            return 0
+
+    jobs = [
+        (
+            source,
+            build_output_path(
+                source,
+                source.parent,
+                suffix=args.suffix,
+                output_format=args.output_format,
+            ).resolve(),
+        )
+        for source in selected
+    ]
+
+    if args.dry_run:
+        for source, destination in jobs:
+            print(f"{source} -> {destination}")
+        return 0
+
+    pending: list[tuple[Path, Path]] = []
+    skipped = 0
+    interactive = not args.inputs and not args.all
+    for source, destination in jobs:
+        if destination.exists() and not args.overwrite:
+            if interactive and _confirm_overwrite(destination):
+                pending.append((source, destination))
+            else:
+                print(f"跳过（输出已存在）：{destination}")
+                skipped += 1
+        else:
+            pending.append((source, destination))
+
+    if not pending:
+        print(f"没有需要转换的文件（跳过 {skipped} 个）。")
+        return 0
+
+    successes = 0
+    failures = 0
+    try:
+        with PowerPointConverter(visible=args.visible) as converter:
+            for source, destination in pending:
+                try:
+                    result = converter.convert(
+                        source,
+                        destination,
+                        overwrite=args.overwrite or destination.exists(),
+                        output_format=args.output_format,
+                    )
+                except Exception as exc:
+                    failures += 1
+                    print(f"失败：{source.name}：{exc}")
+                else:
+                    successes += 1
+                    print(
+                        f"完成：{source.name}（{result.slide_count} 张幻灯片） -> "
+                        f"{destination.name}"
+                    )
+    except Exception as exc:
+        print(f"无法启动 PowerPoint：{exc}")
+        return 1
+
+    print(f"处理结束：成功 {successes} 个，跳过 {skipped} 个，失败 {failures} 个。")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

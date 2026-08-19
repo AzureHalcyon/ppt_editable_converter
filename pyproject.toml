@@ -13,8 +13,7 @@ dependencies = [
 ]
 
 [project.scripts]
-ppt-editable-convert = "ppt_editable_converter.cli:main"
+ppt-editable-convert = "convert_editable:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
-
+[tool.setuptools]
+py-modules = ["convert_editable"]
